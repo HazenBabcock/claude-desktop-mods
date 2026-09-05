@@ -15,9 +15,10 @@
   var CONTEXT_WINDOW_TOKENS = 1000000;   // effective context window; change here if it differs
   var POLL_MS = 2000;                    // normal cadence
   var SLOW_MS = 8000;                    // backoff when a scan is expensive
+  var MISS_LIMIT = 3;                    // consecutive misses before giving up (~6 s)
   var MARK = 'data-ctx-badge';
 
-  var state = { pct: null, tokens: null, lastWarn: 0, lastScanMs: 0 };
+  var state = { pct: null, tokens: null, lastWarn: 0, lastScanMs: 0, misses: 0 };
 
   function isUsage(u) {
     return !!u && typeof u === 'object' &&
@@ -186,14 +187,23 @@
       var root = ring ? reactRoot() : null;
       var usage = root ? findLatestUsage(root) : null;
       if (!ring || !usage) {
-        /* Fail visibly rather than leaving a stale number on screen. */
-        clearLabels();
-        state.pct = null; state.tokens = null;
-        if (Date.now() - state.lastWarn > 60000) {
-          state.lastWarn = Date.now();
-          console.warn('[ctx-badge] anchor missing — ring:', !!ring, 'usage:', !!usage);
+        /* One missed tick is usually a re-render, not a failure: the ring is
+         * briefly unmatchable while React rebuilds that subtree, and clearing
+         * on the first miss blanked the label for a whole poll interval. Give
+         * up only after MISS_LIMIT consecutive misses -- long enough to ride
+         * out a re-render, short enough that a stale number never lingers. */
+        state.misses++;
+        if (state.misses >= MISS_LIMIT) {
+          clearLabels();
+          state.pct = null; state.tokens = null;
+          if (Date.now() - state.lastWarn > 60000) {
+            state.lastWarn = Date.now();
+            console.warn('[ctx-badge] anchor missing for ' + state.misses +
+                         ' ticks — ring:', !!ring, 'usage:', !!usage);
+          }
         }
       } else {
+        state.misses = 0;
         var tok = contextTokens(usage);
         var pct = Math.round(tok / CONTEXT_WINDOW_TOKENS * 100);
         state.tokens = tok; state.pct = pct;

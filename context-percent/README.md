@@ -59,7 +59,10 @@ fiber internals**, and **SVG geometry** (a circle whose dasharray equals its own
 circumference). No component names, no CSS classes.
 
 If the ring or the usage data can't be found it **removes its own label** and warns
-to the console once a minute, rather than leaving a stale number on screen.
+to the console once a minute, rather than leaving a stale number on screen. It waits
+for `MISS_LIMIT` consecutive misses (3, about 6 s) first: the ring is briefly
+unmatchable while React re-renders that subtree, and clearing on the first miss made
+the label blink out for a whole poll interval during ordinary use.
 
 ## Applying it
 
@@ -92,7 +95,7 @@ archive's size delta exactly equal to the target file's. Any mismatch aborts.
 
 ## Debugging (DevTools console, Ctrl+Alt+I)
 
-    window.__ctxBadge.state         // { pct, tokens, lastScanMs, lastWarn }
+    window.__ctxBadge.state         // { pct, tokens, lastScanMs, lastWarn, misses }
     window.__ctxBadge.getWindow()   // current denominator
     window.__ctxBadge.setWindow(2e5)// try a different window size live
     window.__ctxBadge.remove()      // remove the label until the next tick
@@ -152,7 +155,8 @@ exactly. That is how the roll-up bug survived its first check against the toolti
 - The fiber walk is a polling scan, not an event subscription. It costs a few ms
   every 2 s and backs off to 8 s if a scan exceeds 150 ms.
 - React may remove the injected label when it re-renders that subtree; the next
-  tick puts it back, so brief flicker is possible.
+  tick puts it back, so brief flicker is possible. A sustained disappearance
+  (>6 s) is the real failure signal, and logs `anchor missing`.
 - Untested against asar integrity **fuses**. These are generally enforced on macOS
   and Windows but not Linux. Integrity metadata is recomputed correctly either way,
   but if the app refuses to launch after patching, this is the first suspect —
