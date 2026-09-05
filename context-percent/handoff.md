@@ -33,8 +33,7 @@ app — it's only a question of which value gets promoted to the persistent slot
 
 ## Environment
 
-- Dell Inspiron 15 3530, Linux, LXQt desktop, X11 session, xfwm4 window manager
-  (likely a Lubuntu / LXQt Ubuntu spin)
+- Linux desktop, X11 session, Debian/Ubuntu-family (apt-based)
 - `claude-desktop` installed from Anthropic's apt repo (`.deb`, Electron app)
 - **The Linux desktop app does not self-update.** Updates only arrive via
   `sudo apt upgrade`. This means a patch persists until an intentional upgrade — good news
