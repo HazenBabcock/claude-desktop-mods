@@ -23,10 +23,19 @@
     return !!u && typeof u === 'object' &&
       (typeof u.input_tokens === 'number' || typeof u.cache_read_input_tokens === 'number');
   }
-  function usageTotal(u) {
-    return (u.input_tokens || 0) +
-           (u.cache_creation_input_tokens || 0) +
-           (u.cache_read_input_tokens || 0);
+  /* A turn-completion record's `usage` is a ROLL-UP summed over every API
+   * iteration in that turn, and each iteration re-reads most of the context.
+   * A tool-using turn therefore reports 2-4x the real context. The true final
+   * context is the LAST iteration. Last, not max: after a compaction the max
+   * is a stale high-water mark. Falls back to the object itself when there is
+   * no iterations array (a plain per-message usage). */
+  function contextTokens(u) {
+    var it = safeGet(u, 'iterations');
+    var last = (it && it.length) ? it[it.length - 1] : u;
+    if (!last || typeof last !== 'object') last = u;
+    return (safeGet(last, 'input_tokens') || 0) +
+           (safeGet(last, 'cache_creation_input_tokens') || 0) +
+           (safeGet(last, 'cache_read_input_tokens') || 0);
   }
 
   function reactRoot() {
@@ -175,7 +184,7 @@
           console.warn('[ctx-badge] anchor missing — ring:', !!ring, 'usage:', !!usage);
         }
       } else {
-        var tok = usageTotal(usage);
+        var tok = contextTokens(usage);
         var pct = Math.round(tok / CONTEXT_WINDOW_TOKENS * 100);
         state.tokens = tok; state.pct = pct;
         ensureLabel(ring, pct + '%',
