@@ -121,6 +121,28 @@ global handle; the `setTimeout` chain lives in a closure and keeps running. Past
 fixed copy into the console works fine alongside it (the broken one throws before
 reaching any DOM code), but the console noise persists until the app restarts.
 
+## Verifying which payload is installed
+
+Do not grep the whole archive: identifiers like `contextTokens` also occur in the
+bundled agent code, so a whole-file grep gives false positives. Check inside the
+preload entry:
+
+    python3 - <<'EOF'
+    import sys; sys.path.insert(0, '.')
+    from asar_patch import read_asar, walk
+    f, h, b = read_asar('/usr/lib/claude-desktop/resources/app.asar')
+    n = dict(walk(h))['/.vite/build/mainView.js']
+    f.seek(b + int(n['offset']))
+    d = f.read(n['size'])
+    for t in (b'contextTokens', b'safeGet'):
+        print(t.decode(), t in d)
+    EOF
+
+**Verify against a turn that makes several tool calls**, not a plain question. The
+token count comes from a turn-completion record whose `usage` is summed over every
+API iteration, so on a single-iteration turn a wrong formula and a right one agree
+exactly. That is how the roll-up bug survived its first check against the tooltip.
+
 ## Known limits
 
 - The 1,000,000 denominator was confirmed once against the badge tooltip on
