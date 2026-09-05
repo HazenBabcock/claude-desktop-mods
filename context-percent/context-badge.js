@@ -81,6 +81,22 @@
    * between records from tick to tick. Requiring numeric keys picks out the
    * real event log, and the comparison below is strict so ties never depend on
    * traversal order. */
+  /* Two entry shapes share the log. A turn-completion record carries `usage`
+   * directly (a roll-up, alongside `iterations`); an assistant message carries
+   * it at `message.usage`. Only the former exists once a turn has completed in
+   * this app run, so reading `usage` alone left the badge blank on a freshly
+   * opened session until the first prompt was sent. */
+  function entryUsage(v) {
+    var u = safeGet(v, 'usage');
+    if (isUsage(u)) return u;
+    var m = safeGet(v, 'message');
+    if (m && typeof m === 'object' && !isForeign(m)) {
+      u = safeGet(m, 'usage');
+      if (isUsage(u)) return u;
+    }
+    return null;
+  }
+
   function considerContainer(o, keys, best) {
     if (!keys.length || keys.length > 5000) return best;
     var maxIdx = -1, found = null, count = 0;
@@ -90,8 +106,8 @@
       if (isNaN(num) || String(num) !== k) continue;
       var v = safeGet(o, k);
       if (!v || typeof v !== 'object' || isForeign(v)) continue;
-      var u = safeGet(v, 'usage');
-      if (!isUsage(u)) continue;
+      var u = entryUsage(v);
+      if (!u) continue;
       count++;
       if (num > maxIdx) { maxIdx = num; found = u; }
     }

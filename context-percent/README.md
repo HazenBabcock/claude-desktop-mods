@@ -35,8 +35,16 @@ Not from IPC. `contextBridge.exposeInMainWorld` creates non-configurable propert
 so `claudeAppBindings.registerBinding` cannot be wrapped from the page — attempting
 it raises `TypeError: Cannot redefine property`.
 
-Instead, the React tree holds the transcript with per-message Anthropic API `usage`
-objects. Context occupancy is:
+Instead, the React tree holds the session's event log -- an array in a hook, holding
+two entry shapes:
+
+| Shape | Usage at | Present |
+|---|---|---|
+| Assistant message | `entry.message.usage` | as soon as the transcript loads |
+| Turn-completion record | `entry.usage` (+ `entry.iterations`) | only after a turn completes this app run |
+
+Both are read, highest index wins. Reading only the second left the badge blank on a
+freshly opened session until the first prompt was sent. Context occupancy is:
 
     input_tokens + cache_creation_input_tokens + cache_read_input_tokens
 
