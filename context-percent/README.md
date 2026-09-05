@@ -1,7 +1,7 @@
 # context-badge — context-window % beside the Claude Desktop usage ring
 
-Companion to `/home/hbabcock/claude/usage-badge-patch-handoff.md` (outside this repo). Read this first if you're picking
-the work up cold; several of the handoff's assumptions turned out to be wrong.
+Companion to `handoff.md`, the original spec. Read this first if you're picking
+the work up cold; several of that document's assumptions turned out to be wrong.
 
 ## What we found (corrections to the handoff)
 
