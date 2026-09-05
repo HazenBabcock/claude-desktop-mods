@@ -74,20 +74,30 @@
     try { return v.window === v || v.self === v; } catch (e) { return true; }
   }
 
+  /* Only indexed logs count. Earlier this accepted any container holding a
+   * usage-bearing value, which tied every candidate at count 1 and let the
+   * tie-break fall to whichever the walk visited last -- so the reading hopped
+   * between records from tick to tick. Requiring numeric keys picks out the
+   * real event log, and the comparison below is strict so ties never depend on
+   * traversal order. */
   function considerContainer(o, keys, best) {
     if (!keys.length || keys.length > 5000) return best;
-    var bestIdx = -1, found = null, count = 0;
+    var maxIdx = -1, found = null, count = 0;
     for (var i = 0; i < keys.length; i++) {
-      var v = safeGet(o, keys[i]);
+      var k = keys[i];
+      var num = parseInt(k, 10);
+      if (isNaN(num) || String(num) !== k) continue;
+      var v = safeGet(o, k);
       if (!v || typeof v !== 'object' || isForeign(v)) continue;
       var u = safeGet(v, 'usage');
       if (!isUsage(u)) continue;
       count++;
-      var n = parseInt(keys[i], 10);
-      if (!isNaN(n)) { if (n > bestIdx) { bestIdx = n; found = u; } }
-      else if (!found) { found = u; }
+      if (num > maxIdx) { maxIdx = num; found = u; }
     }
-    if (found && (!best || count >= best.count)) return { count: count, usage: found };
+    if (!found) return best;
+    if (!best || count > best.count || (count === best.count && maxIdx > best.idx)) {
+      return { count: count, idx: maxIdx, usage: found };
+    }
     return best;
   }
 
