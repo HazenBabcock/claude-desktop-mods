@@ -1,162 +1,41 @@
-/* context-badge — show context-window usage beside the desktop app's usage ring.
+/* context-badge — show context-window usage beside the Claude Desktop usage ring.
  *
- * Runs in the page's MAIN world (injected by the preload via webFrame.executeJavaScript).
- * Deliberately anchors only on:
- *   - Anthropic API field names (input_tokens, cache_read_input_tokens, ...)
- *   - React's internal fiber conventions (__reactFiber$, memoizedProps/State, child/sibling)
- *   - SVG geometry (a circle whose stroke-dasharray equals its own circumference)
- * It never references a minified component name or a CSS class, because those change
- * on every claude.ai deploy.
+ * Runs in the page's MAIN world, injected by the preload via webFrame.executeJavaScript.
+ *
+ * The badge button carries its own accessibility text, e.g.
+ *   "Usage: 16% of 5-hour limit, Resets in 1 hr 28 min, Context 318.1k / 1M (32%)"
+ * That is the app's own figure, already scoped to the visible session, and it is a
+ * plain DOM attribute present at rest. Reading it beats recomputing the number from
+ * raw token counts in the React tree: that earlier approach had to sum API usage
+ * correctly, pick the right entry shape, and identify which of several open sessions
+ * the log belonged to -- and got each of those wrong in turn.
+ *
+ * Anchors: SVG geometry (a circle whose stroke-dasharray equals its own
+ * circumference) and the numeric shape "<used> / <total> (<pct>%)". Deliberately not
+ * the word "Context", which localizes; digits, "/" and "%" do not.
  */
 (function () {
   'use strict';
   if (window.__ctxBadge) return;
 
-  var CONTEXT_WINDOW_TOKENS = 1000000;   // effective context window; change here if it differs
-  var POLL_MS = 2000;                    // normal cadence
-  var SLOW_MS = 8000;                    // backoff when a scan is expensive
-  var MISS_LIMIT = 3;                    // consecutive misses before giving up (~6 s)
+  var POLL_MS = 2000;      // cadence; the scan is now a couple of DOM reads
+  var MISS_LIMIT = 3;      // consecutive misses before giving up (~6 s)
   var MARK = 'data-ctx-badge';
 
-  var state = { pct: null, tokens: null, lastWarn: 0, lastScanMs: 0, misses: 0 };
+  /* "318.1k / 1M (32%)" -- the trailing parenthesised percent is the context one;
+   * the leading "16%" in the same string is the 5-hour figure and is not in parens. */
+  var NUM = '\\d+(?:[.,]\\d+)?\\s*[kKmM]?';
+  var FULL = new RegExp('(' + NUM + ')\\\\s*/\\\\s*(' + NUM + ')\\\\s*\\\\((\\\\d+)\\\\s*%\\\\)');
+  var PARENS_PCT = /\((\d+)\s*%\)/g;
 
-  function isUsage(u) {
-    return !!u && typeof u === 'object' &&
-      (typeof u.input_tokens === 'number' || typeof u.cache_read_input_tokens === 'number');
-  }
-  /* A turn-completion record's `usage` is a ROLL-UP summed over every API
-   * iteration in that turn, and each iteration re-reads most of the context.
-   * A tool-using turn therefore reports 2-4x the real context. The true final
-   * context is the LAST iteration. Last, not max: after a compaction the max
-   * is a stale high-water mark. Falls back to the object itself when there is
-   * no iterations array (a plain per-message usage). */
-  function contextTokens(u) {
-    var it = safeGet(u, 'iterations');
-    var last = (it && it.length) ? it[it.length - 1] : u;
-    if (!last || typeof last !== 'object') last = u;
-    return (safeGet(last, 'input_tokens') || 0) +
-           (safeGet(last, 'cache_creation_input_tokens') || 0) +
-           (safeGet(last, 'cache_read_input_tokens') || 0);
+  var state = { pct: null, detail: null, raw: null, misses: 0, lastWarn: 0, lastScanMs: 0 };
+
+  function now() {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
   }
 
-  function reactRoot() {
-    var host = document.getElementById('root') || document.body;
-    if (host) {
-      var hk = Object.keys(host);
-      for (var i = 0; i < hk.length; i++) {
-        if (hk[i].indexOf('__reactContainer$') === 0) return host[hk[i]];
-      }
-    }
-    var els = document.querySelectorAll('body *');
-    for (var j = 0; j < els.length; j++) {
-      var ek = Object.keys(els[j]);
-      for (var k = 0; k < ek.length; k++) {
-        if (ek[k].indexOf('__reactFiber$') === 0) {
-          var f = els[j][ek[k]];
-          while (f && f.return) f = f.return;
-          return f;
-        }
-      }
-    }
-    return null;
-  }
-
-  /* Among containers holding usage-bearing entries, prefer the one with the most
-   * entries (the real transcript), and within it the highest numeric index — the
-   * newest message. Using the newest rather than the largest matters: after a
-   * compaction the largest is a stale high-water mark that never comes back down. */
-  /* Every property read below can throw: the fiber tree holds references to
-   * cross-origin frame Windows (the analytics iframe), and touching any named
-   * property on one raises SecurityError. Nothing is read outside a try. */
-  function safeGet(o, k) { try { return o[k]; } catch (e) { return undefined; } }
-  function safeKeys(o) { try { return Object.keys(o); } catch (e) { return null; } }
-  function isForeign(v) {
-    /* A cross-origin Window. Even the identity check throws, which is itself the tell. */
-    try { return v.window === v || v.self === v; } catch (e) { return true; }
-  }
-
-  /* Only indexed logs count. Earlier this accepted any container holding a
-   * usage-bearing value, which tied every candidate at count 1 and let the
-   * tie-break fall to whichever the walk visited last -- so the reading hopped
-   * between records from tick to tick. Requiring numeric keys picks out the
-   * real event log, and the comparison below is strict so ties never depend on
-   * traversal order. */
-  /* Two entry shapes share the log. A turn-completion record carries `usage`
-   * directly (a roll-up, alongside `iterations`); an assistant message carries
-   * it at `message.usage`. Only the former exists once a turn has completed in
-   * this app run, so reading `usage` alone left the badge blank on a freshly
-   * opened session until the first prompt was sent. */
-  function entryUsage(v) {
-    var u = safeGet(v, 'usage');
-    if (isUsage(u)) return u;
-    var m = safeGet(v, 'message');
-    if (m && typeof m === 'object' && !isForeign(m)) {
-      u = safeGet(m, 'usage');
-      if (isUsage(u)) return u;
-    }
-    return null;
-  }
-
-  function considerContainer(o, keys, best) {
-    if (!keys.length || keys.length > 5000) return best;
-    var maxIdx = -1, found = null, count = 0;
-    for (var i = 0; i < keys.length; i++) {
-      var k = keys[i];
-      var num = parseInt(k, 10);
-      if (isNaN(num) || String(num) !== k) continue;
-      var v = safeGet(o, k);
-      if (!v || typeof v !== 'object' || isForeign(v)) continue;
-      var u = entryUsage(v);
-      if (!u) continue;
-      count++;
-      if (num > maxIdx) { maxIdx = num; found = u; }
-    }
-    if (!found) return best;
-    if (!best || count > best.count || (count === best.count && maxIdx > best.idx)) {
-      return { count: count, idx: maxIdx, usage: found };
-    }
-    return best;
-  }
-
-  var SKIP = { children: 1, _owner: 1, _store: 1, stateNode: 1, return: 1, child: 1,
-               sibling: 1, alternate: 1, _debugOwner: 1, dependencies: 1, updateQueue: 1,
-               window: 1, self: 1, parent: 1, top: 1, frames: 1, opener: 1, location: 1,
-               contentWindow: 1, contentDocument: 1, ownerDocument: 1, defaultView: 1,
-               view: 1, target: 1, currentTarget: 1, srcElement: 1, relatedTarget: 1 };
-
-  function findLatestUsage(root) {
-    var best = null, seen = new Set(), visited = 0, stack = [root];
-    function scan(o, depth) {
-      if (!o || typeof o !== 'object' || depth > 3 || seen.has(o)) return;
-      seen.add(o);
-      var keys = safeKeys(o);
-      if (!keys) return;
-      best = considerContainer(o, keys, best);
-      for (var i = 0; i < keys.length && i < 200; i++) {
-        var k = keys[i];
-        if (SKIP[k]) continue;
-        var v = safeGet(o, k);
-        if (v && typeof v === 'object' && !isForeign(v)) scan(v, depth + 1);
-      }
-    }
-    while (stack.length && visited < 40000) {
-      var f = stack.pop();
-      if (!f) continue;
-      visited++;
-      if (f.memoizedProps) scan(f.memoizedProps, 0);
-      var h = f.memoizedState, hi = 0;
-      while (h && typeof h === 'object' && hi < 25) {
-        if (h.memoizedState) scan(h.memoizedState, 0);
-        h = h.next; hi++;
-      }
-      if (f.child) stack.push(f.child);
-      if (f.sibling) stack.push(f.sibling);
-    }
-    return best ? best.usage : null;
-  }
-
-  /* The gauge: a <circle> whose stroke-dasharray equals 2*pi*r, i.e. one full
-   * circumference. If several match, take the lowest on screen (the status bar). */
+  /* The gauge: a <circle> whose stroke-dasharray is one full circumference.
+   * If several match, take the lowest on screen (the status bar). */
   function findRing() {
     var cs = document.querySelectorAll('svg circle[stroke-dasharray]');
     var best = null;
@@ -173,6 +52,31 @@
     return best ? best.el : null;
   }
 
+  /* Walk up from the ring rather than querying the document, so the text we read
+   * belongs to this ring -- and therefore to the session actually on screen. */
+  function ariaFor(ring) {
+    var n = ring, i, a;
+    for (i = 0; i < 8 && n; i++, n = n.parentElement) {
+      a = n.getAttribute && n.getAttribute('aria-label');
+      if (a && FULL.test(a)) return a;
+    }
+    for (n = ring, i = 0; i < 8 && n; i++, n = n.parentElement) {
+      a = n.getAttribute && n.getAttribute('aria-label');
+      if (a && a.indexOf('%)') !== -1) return a;
+    }
+    return null;
+  }
+
+  function parse(aria) {
+    var m = FULL.exec(aria);
+    if (m) return { pct: parseInt(m[3], 10), used: m[1].trim(), total: m[2].trim() };
+    /* Fallback: last parenthesised percentage in the string. */
+    var last = null, x;
+    PARENS_PCT.lastIndex = 0;
+    while ((x = PARENS_PCT.exec(aria)) !== null) last = x[1];
+    return last === null ? null : { pct: parseInt(last, 10), used: null, total: null };
+  }
+
   function ensureLabel(ring, text, title) {
     var svg = ring.ownerSVGElement || ring.closest('svg');
     if (!svg || !svg.parentElement) return false;
@@ -180,7 +84,7 @@
     if (!el) {
       el = document.createElement('span');
       el.setAttribute(MARK, '1');
-      el.setAttribute('aria-label', 'Context window used');
+      el.setAttribute('aria-hidden', 'true');   /* the button's own label already says it */
       el.style.cssText = 'font-size:11px;line-height:1;opacity:0.75;white-space:nowrap;' +
                          'font-variant-numeric:tabular-nums;pointer-events:none;';
       svg.insertAdjacentElement('afterend', el);
@@ -196,54 +100,47 @@
   }
 
   function tick() {
-    var t0 = (performance && performance.now) ? performance.now() : Date.now();
-    var next = POLL_MS;
+    var t0 = now();
     try {
       var ring = findRing();
-      var root = ring ? reactRoot() : null;
-      var usage = root ? findLatestUsage(root) : null;
-      if (!ring || !usage) {
-        /* One missed tick is usually a re-render, not a failure: the ring is
-         * briefly unmatchable while React rebuilds that subtree, and clearing
-         * on the first miss blanked the label for a whole poll interval. Give
-         * up only after MISS_LIMIT consecutive misses -- long enough to ride
-         * out a re-render, short enough that a stale number never lingers. */
+      var aria = ring ? ariaFor(ring) : null;
+      var got = aria ? parse(aria) : null;
+      if (!ring || !got) {
+        /* One missed tick is usually a re-render, not a failure. Give up only after
+         * MISS_LIMIT consecutive misses -- long enough to ride out a re-render,
+         * short enough that a stale number never lingers. */
         state.misses++;
         if (state.misses >= MISS_LIMIT) {
           clearLabels();
-          state.pct = null; state.tokens = null;
+          state.pct = null; state.detail = null; state.raw = null;
           if (Date.now() - state.lastWarn > 60000) {
             state.lastWarn = Date.now();
             console.warn('[ctx-badge] anchor missing for ' + state.misses +
-                         ' ticks — ring:', !!ring, 'usage:', !!usage);
+                         ' ticks — ring:', !!ring, 'aria:', aria);
           }
         }
       } else {
         state.misses = 0;
-        var tok = contextTokens(usage);
-        var pct = Math.round(tok / CONTEXT_WINDOW_TOKENS * 100);
-        state.tokens = tok; state.pct = pct;
-        ensureLabel(ring, pct + '%',
-          'Context: ' + tok.toLocaleString() + ' / ' +
-          CONTEXT_WINDOW_TOKENS.toLocaleString() + ' tokens');
+        state.pct = got.pct;
+        state.detail = got.used ? got.used + ' / ' + got.total : null;
+        state.raw = aria;
+        ensureLabel(ring, got.pct + '%',
+                    state.detail ? 'Context ' + state.detail : aria);
       }
     } catch (e) {
       console.error('[ctx-badge] tick failed', e);
     }
-    var dt = ((performance && performance.now) ? performance.now() : Date.now()) - t0;
-    state.lastScanMs = Math.round(dt);
-    if (dt > 150) next = SLOW_MS;
-    setTimeout(tick, next);
+    state.lastScanMs = Math.round(now() - t0);
+    setTimeout(tick, POLL_MS);
   }
 
   window.__ctxBadge = {
-    version: 1,
+    version: 2,
     state: state,
-    setWindow: function (n) { CONTEXT_WINDOW_TOKENS = n; },
-    getWindow: function () { return CONTEXT_WINDOW_TOKENS; },
+    read: function () { var r = findRing(); return r ? ariaFor(r) : null; },
     remove: clearLabels
   };
 
-  setTimeout(tick, 3000);
-  console.log('[ctx-badge] installed (window =', CONTEXT_WINDOW_TOKENS, 'tokens)');
+  setTimeout(tick, 1500);
+  console.log('[ctx-badge] installed (reads the badge\'s own aria-label)');
 })();
